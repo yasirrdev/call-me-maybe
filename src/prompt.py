@@ -1,9 +1,8 @@
 import json
-from typing import List
 from src.models import FuncitonDef
 
 
-def build_prompt(query: str, functions: List[FuncitonDef]) -> str:
+def build_prompt(query: str, functions: list[FuncitonDef]) -> str:
 
     fn_list = json.dumps(
         [f.model_dump() for f in functions],

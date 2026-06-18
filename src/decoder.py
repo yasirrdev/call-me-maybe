@@ -1,6 +1,6 @@
 import json
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any
 import numpy as np
 from llm_sdk.llm_sdk import Small_LLM_Model
 from src.models import FuncitonDef
@@ -9,19 +9,19 @@ from src.models import FuncitonDef
 NEG_INF: float = -math.inf
 
 
-def _load_vocab(model: Small_LLM_Model) -> Dict[str, int]:
+def _load_vocab(model: Small_LLM_Model) -> dict[str, int]:
 
     vocab_path = model.get_path_to_vocab_file()
     with open(vocab_path, "r", encoding="utf-8") as f:
-        vocab: Dict[str, int] = json.load(f)
+        vocab: dict[str, int] = json.load(f)
     return vocab
 
 
 def _get_valid_token_ids(
-        vocab: Dict[str, int],
-        allowed_chars: str) -> List[int]:
+        vocab: dict[str, int],
+        allowed_chars: str) -> list[int]:
 
-    valid: List[int] = []
+    valid: list[int] = []
     for token_str, token_id in vocab.items():
         if token_str and token_str[0] in allowed_chars:
             valid.append(token_id)
@@ -29,8 +29,8 @@ def _get_valid_token_ids(
 
 
 def _mask_logits(
-        logits: List[float],
-        valid_ids: List[int]) -> List[float]:
+        logits: list[float],
+        valid_ids: list[int]) -> list[float]:
 
     masked = [NEG_INF] * len(logits)
     for tid in valid_ids:
@@ -39,11 +39,11 @@ def _mask_logits(
     return masked
 
 
-def _argmax(logits: List[float]) -> int:
+def _argmax(logits: list[float]) -> int:
     return int(np.argmax(logits))
 
 
-def _build_json_schema(fn_def: FuncitonDef) -> Dict[str, Any]:
+def _build_json_schema(fn_def: FuncitonDef) -> dict[str, Any]:
     return {
         "fn_name": fn_def.name,
         "args": {k: None for k in fn_def.parameters}
@@ -52,9 +52,9 @@ def _build_json_schema(fn_def: FuncitonDef) -> Dict[str, Any]:
 
 def _select_function(
         model: Small_LLM_Model,
-        vocab: Dict[str, int],
-        input_ids: List[int],
-        functions: List[FuncitonDef]) -> FuncitonDef:
+        vocab: dict[str, int],
+        input_ids: list[int],
+        functions: list[FuncitonDef]) -> FuncitonDef:
 
     fn_names = [fn.name for fn in functions]
     id_to_token = {v: k for k, v in vocab.items()}
@@ -110,8 +110,8 @@ def _coerce_value(raw: str, type_hint: str) -> Any:
 
 def _decode_argument(
         model: Small_LLM_Model,
-        vocab: Dict[str, int],
-        input_ids: List[int],
+        vocab: dict[str, int],
+        input_ids: list[int],
         param_type: str,
         max_tokens: int = 32) -> str:
 
@@ -157,21 +157,21 @@ def _decode_argument(
     return generated.strip()
 
 
-def decoded_function_call(
+def decode_function_call(
         model: Small_LLM_Model,
         prompt: str,
-        functions: List[FuncitonDef]) -> Optional[Dict[str, Any]]:
+        functions: list[FuncitonDef]) -> dict[str, Any] | None:
 
     try:
         vocab = _load_vocab(model)
         input_tensor = model.encode(prompt)
-        input_ids: List[int] = input_tensor[0].tolist()
+        input_ids: list[int] = input_tensor[0].tolist()
 
         selected_fn = _select_function(
             model, vocab, input_ids, functions
         )
 
-        args: Dict[str, Any] = {}
+        args: dict[str, Any] = {}
         for param_name, param_def in selected_fn.parameters.items():
             raw = _decode_argument(
                 model, vocab, input_ids, param_def.type

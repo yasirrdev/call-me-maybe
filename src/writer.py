@@ -1,10 +1,9 @@
 import json
 from pathlib import Path
-from typing import List
 from src.models import OutputEntry
 
 
-def write_results(results: List[OutputEntry], path: Path) -> None:
+def write_results(results: list[OutputEntry], path: Path) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     data = [r.model_dump() for r in results]

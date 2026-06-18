@@ -1,10 +1,9 @@
 import json
 from pathlib import Path
-from typing import List
 from src.models import FuncitonDef
 
 
-def load_tests(path: Path) -> List[str]:
+def load_tests(path: Path) -> list[str]:
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -18,7 +17,7 @@ def load_tests(path: Path) -> List[str]:
         raise ValueError(f"Invalid JSON in tests file: {e}")
 
 
-def load_functions(path: Path) -> List[FuncitonDef]:
+def load_functions(path: Path) -> list[FuncitonDef]:
 
     try:
         with open(path, "r", encoding="utf-8") as f:
