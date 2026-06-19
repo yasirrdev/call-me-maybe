@@ -2,7 +2,7 @@ import json
 import math
 from typing import Any
 import numpy as np
-from llm_sdk.llm_sdk import Small_LLM_Model
+from llm_sdk import Small_LLM_Model
 from src.models import FuncitonDef
 
 
