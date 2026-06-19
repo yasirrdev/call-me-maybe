@@ -1,8 +1,13 @@
+"""Restricted decoding for structured JSON function-call output."""
+
 import json
 import math
+import re
 from typing import Any
+
 import numpy as np
-from llm_sdk import Small_LLM_Model
+
+from llm_sdk.llm_sdk import Small_LLM_Model
 from src.models import FuncitonDef
 
 
@@ -10,28 +15,25 @@ NEG_INF: float = -math.inf
 
 
 def _load_vocab(model: Small_LLM_Model) -> dict[str, int]:
-
+    """Load vocabulary mapping from token string to token id."""
     vocab_path = model.get_path_to_vocab_file()
     with open(vocab_path, "r", encoding="utf-8") as f:
         vocab: dict[str, int] = json.load(f)
     return vocab
 
 
-def _get_valid_token_ids(
-        vocab: dict[str, int],
-        allowed_chars: str) -> list[int]:
-
-    valid: list[int] = []
+def _clean_vocab(vocab: dict[str, int]) -> list[tuple[int, str]]:
+    """Precompute decoded (id, text) pairs once, replacing BPE markers."""
+    result: list[tuple[int, str]] = []
     for token_str, token_id in vocab.items():
-        if token_str and token_str[0] in allowed_chars:
-            valid.append(token_id)
-    return valid
+        clean = token_str.replace("Ġ", " ").replace("Ċ", "\n")
+        if clean:
+            result.append((token_id, clean))
+    return result
 
 
-def _mask_logits(
-        logits: list[float],
-        valid_ids: list[int]) -> list[float]:
-
+def _mask_logits(logits: list[float], valid_ids: list[int]) -> list[float]:
+    """Set all logits to -inf except valid token ids."""
     masked = [NEG_INF] * len(logits)
     for tid in valid_ids:
         if tid < len(masked):
@@ -40,48 +42,44 @@ def _mask_logits(
 
 
 def _argmax(logits: list[float]) -> int:
+    """Return index of maximum value."""
     return int(np.argmax(logits))
-
-
-def _build_json_schema(fn_def: FuncitonDef) -> dict[str, Any]:
-    return {
-        "fn_name": fn_def.name,
-        "args": {k: None for k in fn_def.parameters}
-    }
 
 
 def _select_function(
         model: Small_LLM_Model,
-        vocab: dict[str, int],
+        clean_vocab: list[tuple[int, str]],
         input_ids: list[int],
         functions: list[FuncitonDef]) -> FuncitonDef:
-
+    """Select the function whose name best matches generated tokens."""
     fn_names = [fn.name for fn in functions]
-    id_to_token = {v: k for k, v in vocab.items()}
+    id_to_clean = dict(clean_vocab)
 
     generated = ""
     current_ids = list(input_ids)
 
     for _ in range(64):
-        logits = model.get_logits_from_input_ids(current_ids)
-
         candidates = [n for n in fn_names if n.startswith(generated)]
         if not candidates:
             break
-
         if len(candidates) == 1 and generated == candidates[0]:
             break
 
-        allowed_chars = {c[len(generated)] for c in candidates}
-        valid_ids = _get_valid_token_ids(vocab, "".join(allowed_chars))
+        logits = model.get_logits_from_input_ids(current_ids)
+
+        valid_ids = [
+            tid for tid, clean in clean_vocab
+            if any((generated + clean).startswith(c) for c in candidates)
+            or any(c.startswith(generated + clean) for c in candidates)
+        ]
 
         if not valid_ids:
             break
 
         masked = _mask_logits(logits, valid_ids)
         next_id = _argmax(masked)
-        token_str = id_to_token.get(next_id, "")
-        generated += token_str
+        clean = id_to_clean.get(next_id, "")
+        generated += clean
         current_ids.append(next_id)
 
         if any(generated == n for n in fn_names):
@@ -94,65 +92,60 @@ def _select_function(
     best = max(functions, key=lambda f: len(
         [1 for a, b in zip(f.name, generated) if a == b]
     ))
-
     return best
 
 
 def _coerce_value(raw: str, type_hint: str) -> Any:
-
+    """Coerce a raw string value to the expected type."""
     type_hint = type_hint.lower()
     if type_hint == "number":
-        return float(raw)
+        return float(raw) if raw else 0.0
     if type_hint == "boolean":
-        return raw.lower() == "true"
+        return raw.lower().startswith("true")
     return raw
 
 
 def _decode_argument(
         model: Small_LLM_Model,
-        vocab: dict[str, int],
+        clean_vocab: list[tuple[int, str]],
         input_ids: list[int],
         param_type: str,
-        max_tokens: int = 32) -> str:
-
-    id_to_token = {v: k for k, v in vocab.items()}
+        max_tokens: int = 16) -> str:
+    """Generate a single argument value using restricted decoding."""
+    id_to_clean = dict(clean_vocab)
 
     if param_type == "number":
-        allowed = "0123456789.-"
+        pattern = re.compile(r"[\s]*-?[0-9]*\.?[0-9]+")
     elif param_type == "boolean":
-        allowed = "tf"
+        pattern = re.compile(r"[\s]*(true|false|tru|fals|tr|fa|t|f)")
     else:
-        allowed = (
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789 .,!?-_"
-        )
-        stop_chars = {'"'}
+        pattern = re.compile(r'[^"\n]+')
 
     generated = ""
     current_ids = list(input_ids)
 
     for _ in range(max_tokens):
         logits = model.get_logits_from_input_ids(current_ids)
-        current_allowed = (allowed if not generated
-                           else allowed + "".join(stop_chars))
-        valid_ids = _get_valid_token_ids(vocab, current_allowed)
+
+        valid_ids = [
+            tid for tid, clean in clean_vocab
+            if pattern.match(generated + clean)
+        ]
 
         if not valid_ids:
             break
 
         masked = _mask_logits(logits, valid_ids)
         next_id = _argmax(masked)
-        token_str = id_to_token.get(next_id, "")
+        clean = id_to_clean.get(next_id, "")
 
-        if any(c in token_str for c in stop_chars):
+        if clean in ("\n", '"') or (
+            param_type != "string" and clean == " " and generated
+        ):
             break
 
-        generated += token_str
+        generated += clean
         current_ids.append(next_id)
-
-        if not generated:
-            continue
 
     return generated.strip()
 
@@ -161,22 +154,24 @@ def decode_function_call(
         model: Small_LLM_Model,
         prompt: str,
         functions: list[FuncitonDef]) -> dict[str, Any] | None:
-
+    """Run restricted decoding to produce a function call from a prompt."""
     try:
         vocab = _load_vocab(model)
+        clean_vocab = _clean_vocab(vocab)
         input_tensor = model.encode(prompt)
         input_ids: list[int] = input_tensor[0].tolist()
 
         selected_fn = _select_function(
-            model, vocab, input_ids, functions
+            model, clean_vocab, input_ids, functions
         )
 
         args: dict[str, Any] = {}
         for param_name, param_def in selected_fn.parameters.items():
             raw = _decode_argument(
-                model, vocab, input_ids, param_def.type
+                model, clean_vocab, input_ids, param_def.type
             )
             args[param_name] = _coerce_value(raw, param_def.type)
+
         return {"fn_name": selected_fn.name, "args": args}
 
     except Exception as e:
