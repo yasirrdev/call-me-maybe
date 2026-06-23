@@ -4,7 +4,7 @@
 import argparse
 import sys
 from pathlib import Path
-from llm_sdk.llm_sdk import Small_LLM_Model
+from llm_sdk import Small_LLM_Model
 
 from src.decoder import decode_function_call
 from src.loader import load_functions, load_tests

@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from llm_sdk.llm_sdk import Small_LLM_Model
+from llm_sdk import Small_LLM_Model
 from src.models import FuncitonDef
 
 
@@ -58,7 +58,7 @@ def _select_function(
     generated = ""
     current_ids = list(input_ids)
 
-    for _ in range(64):
+    for i in range(64):
         candidates = [n for n in fn_names if n.startswith(generated)]
         if not candidates:
             break
@@ -115,22 +115,27 @@ def _decode_argument(
     id_to_clean = dict(clean_vocab)
 
     if param_type == "number":
-        pattern = re.compile(r"[\s]*-?[0-9]*\.?[0-9]+")
+        allowed_re = re.compile(r'^[\s\-0-9\.]+$')
     elif param_type == "boolean":
-        pattern = re.compile(r"[\s]*(true|false|tru|fals|tr|fa|t|f)")
+        allowed_re = re.compile(r'^[\sA-Za-z]+$')
     else:
-        pattern = re.compile(r'[^"\n]+')
+        allowed_re = re.compile(r'^[^"\n,\}\]\:\(\)]+$')
 
     generated = ""
     current_ids = list(input_ids)
 
+    forbidden_chars = ('"', '\n', ',', '}', ']', ':', '(', ')', ';')
+
     for _ in range(max_tokens):
         logits = model.get_logits_from_input_ids(current_ids)
 
-        valid_ids = [
-            tid for tid, clean in clean_vocab
-            if pattern.match(generated + clean)
-        ]
+        valid_ids = []
+        for tid, clean in clean_vocab:
+            if any(ch in clean for ch in forbidden_chars):
+                continue
+            candidate = generated + clean
+            if allowed_re.fullmatch(candidate):
+                valid_ids.append(tid)
 
         if not valid_ids:
             break
@@ -139,10 +144,15 @@ def _decode_argument(
         next_id = _argmax(masked)
         clean = id_to_clean.get(next_id, "")
 
-        if clean in ("\n", '"') or (
-            param_type != "string" and clean == " " and generated
-        ):
+        if any(ch in clean for ch in forbidden_chars):
             break
+
+        if param_type != "string" and clean == " " and generated:
+            break
+
+        if param_type == "number":
+            if re.fullmatch(r'^\s*-?\d+(?:\.\d+)?\s*$', generated):
+                break
 
         generated += clean
         current_ids.append(next_id)
@@ -164,13 +174,23 @@ def decode_function_call(
         selected_fn = _select_function(
             model, clean_vocab, input_ids, functions
         )
-
         args: dict[str, Any] = {}
-        for param_name, param_def in selected_fn.parameters.items():
-            raw = _decode_argument(
-                model, clean_vocab, input_ids, param_def.type
+
+        for param_name, param_schema in selected_fn.parameters.items():
+            param_type = param_schema.type.lower()
+
+            hint_text = f' "{param_name}": '
+            hint_ids_tensor = model.encode(hint_text)
+            hint_ids: list[int] = hint_ids_tensor[0].tolist()
+
+            start_ids = list(input_ids) + hint_ids
+
+            raw_value = _decode_argument(
+                model, clean_vocab, start_ids, param_type, max_tokens=64
             )
-            args[param_name] = _coerce_value(raw, param_def.type)
+
+            coerced = _coerce_value(raw_value, param_type)
+            args[param_name] = coerced
 
         return {"fn_name": selected_fn.name, "args": args}
 
