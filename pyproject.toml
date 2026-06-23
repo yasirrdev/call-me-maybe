@@ -5,7 +5,11 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0",
     "numpy>=1.24",
+    "llm-sdk",
 ]
+
+[tool.uv.sources]
+llm-sdk = { path = "llm_sdk", editable = true }
 
 [build-system]
 requires = ["hatchling"]
