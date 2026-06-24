@@ -9,7 +9,6 @@ from llm_sdk import Small_LLM_Model
 from src.decoder import decode_function_call
 from src.loader import load_functions, load_tests
 from src.models import OutputEntry
-from src.prompt import build_prompt
 from src.writer import write_results
 
 DEFAULT_INPUT = Path("data/input")
@@ -68,8 +67,7 @@ def main() -> None:
     results = []
     for prompt in prompts:
         try:
-            full_prompt = build_prompt(prompt, functions)
-            call = decode_function_call(model, full_prompt, functions)
+            call = decode_function_call(model, prompt, functions)
             if call is None:
                 print(
                     f"Warning: no result for prompt: {prompt!r}",

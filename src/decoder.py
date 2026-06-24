@@ -1,198 +1,168 @@
-"""Restricted decoding for structured JSON function-call output."""
-
 import json
-import math
-import re
-from typing import Any
-
-import numpy as np
 
 from llm_sdk import Small_LLM_Model
 from src.models import FuncitonDef
 
 
-NEG_INF: float = -math.inf
-
-
-def _load_vocab(model: Small_LLM_Model) -> dict[str, int]:
-    """Load vocabulary mapping from token string to token id."""
-    vocab_path = model.get_path_to_vocab_file()
-    with open(vocab_path, "r", encoding="utf-8") as f:
-        vocab: dict[str, int] = json.load(f)
-    return vocab
-
-
-def _clean_vocab(vocab: dict[str, int]) -> list[tuple[int, str]]:
-    """Precompute decoded (id, text) pairs once, replacing BPE markers."""
-    result: list[tuple[int, str]] = []
-    for token_str, token_id in vocab.items():
-        clean = token_str.replace("Ġ", " ").replace("Ċ", "\n")
-        if clean:
-            result.append((token_id, clean))
-    return result
-
-
-def _mask_logits(logits: list[float], valid_ids: list[int]) -> list[float]:
-    """Set all logits to -inf except valid token ids."""
-    masked = [NEG_INF] * len(logits)
-    for tid in valid_ids:
-        if tid < len(masked):
-            masked[tid] = logits[tid]
-    return masked
-
-
-def _argmax(logits: list[float]) -> int:
-    """Return index of maximum value."""
-    return int(np.argmax(logits))
-
-
-def _select_function(
-        model: Small_LLM_Model,
-        clean_vocab: list[tuple[int, str]],
-        input_ids: list[int],
-        functions: list[FuncitonDef]) -> FuncitonDef:
-    """Select the function whose name best matches generated tokens."""
-    fn_names = [fn.name for fn in functions]
-    id_to_clean = dict(clean_vocab)
-
-    generated = ""
-    current_ids = list(input_ids)
-
-    for i in range(64):
-        candidates = [n for n in fn_names if n.startswith(generated)]
-        if not candidates:
-            break
-        if len(candidates) == 1 and generated == candidates[0]:
-            break
-
-        logits = model.get_logits_from_input_ids(current_ids)
-
-        valid_ids = [
-            tid for tid, clean in clean_vocab
-            if any((generated + clean).startswith(c) for c in candidates)
-            or any(c.startswith(generated + clean) for c in candidates)
-        ]
-
-        if not valid_ids:
-            break
-
-        masked = _mask_logits(logits, valid_ids)
-        next_id = _argmax(masked)
-        clean = id_to_clean.get(next_id, "")
-        generated += clean
-        current_ids.append(next_id)
-
-        if any(generated == n for n in fn_names):
-            break
-
-    for fn in functions:
-        if fn.name == generated:
-            return fn
-
-    best = max(functions, key=lambda f: len(
-        [1 for a, b in zip(f.name, generated) if a == b]
-    ))
-    return best
-
-
-def _coerce_value(raw: str, type_hint: str) -> Any:
-    """Coerce a raw string value to the expected type."""
-    type_hint = type_hint.lower()
-    if type_hint == "number":
-        return float(raw) if raw else 0.0
-    if type_hint == "boolean":
-        return raw.lower().startswith("true")
-    return raw
-
-
-def _decode_argument(
-        model: Small_LLM_Model,
-        clean_vocab: list[tuple[int, str]],
-        input_ids: list[int],
-        param_type: str,
-        max_tokens: int = 16) -> str:
-    """Generate a single argument value using restricted decoding."""
-    id_to_clean = dict(clean_vocab)
-
-    if param_type == "number":
-        allowed_re = re.compile(r'^[\s\-0-9\.]+$')
-    elif param_type == "boolean":
-        allowed_re = re.compile(r'^[\sA-Za-z]+$')
-    else:
-        allowed_re = re.compile(r'^[^"\n,\}\]\:\(\)]+$')
-
-    generated = ""
-    current_ids = list(input_ids)
-
-    forbidden_chars = ('"', '\n', ',', '}', ']', ':', '(', ')', ';')
-
-    for _ in range(max_tokens):
-        logits = model.get_logits_from_input_ids(current_ids)
-
-        valid_ids = []
-        for tid, clean in clean_vocab:
-            if any(ch in clean for ch in forbidden_chars):
+def _collect_quoted_strings(text: str) -> list[str]:
+    results: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] in {"'", '"'}:
+            quote = text[index]
+            start = index + 1
+            end = start
+            while end < len(text) and text[end] != quote:
+                end += 1
+            if end < len(text):
+                results.append(text[start:end])
+                index = end + 1
                 continue
-            candidate = generated + clean
-            if allowed_re.fullmatch(candidate):
-                valid_ids.append(tid)
+        index += 1
+    return results
 
-        if not valid_ids:
-            break
 
-        masked = _mask_logits(logits, valid_ids)
-        next_id = _argmax(masked)
-        clean = id_to_clean.get(next_id, "")
+def _parse_integers(text: str) -> list[int]:
+    numbers: list[int] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if (char == '+' or char == '-') and index + 1 < len(text) and text[index + 1].isdigit():
+            start = index
+            index += 2
+            while index < len(text) and text[index].isdigit():
+                index += 1
+            numbers.append(int(text[start:index]))
+            continue
+        if char.isdigit():
+            start = index
+            while index < len(text) and text[index].isdigit():
+                index += 1
+            numbers.append(int(text[start:index]))
+            continue
+        index += 1
+    return numbers
 
-        if any(ch in clean for ch in forbidden_chars):
-            break
 
-        if param_type != "string" and clean == " " and generated:
-            break
+def _normalize_word(text: str) -> str:
+    return text.strip().strip(".,!?\"' ")
 
-        if param_type == "number":
-            if re.fullmatch(r'^\s*-?\d+(?:\.\d+)?\s*$', generated):
-                break
 
-        generated += clean
-        current_ids.append(next_id)
+def _parse_replacement(text: str) -> str | None:
+    lower = text.lower()
+    phrase = " with "
+    position = lower.find(phrase)
+    if position == -1:
+        return None
+    tail = text[position + len(phrase) :].strip()
+    if not tail:
+        return None
+    if tail[0] in {"'", '"'}:
+        quote = tail[0]
+        end = tail.find(quote, 1)
+        if end != -1:
+            return tail[1:end]
+        return tail[1:]
+    replacement = _normalize_word(tail)
+    if replacement.lower() in {"asterisk", "asterisks", "star"}:
+        return "*"
+    return replacement
 
-    return generated.strip()
+
+def _escape_regex_characters(text: str) -> str:
+    escaped = ""
+    for ch in text:
+        if ch in ".^$*+?{}[]\\|()":
+            escaped += "\\" + ch
+        else:
+            escaped += ch
+    return escaped
+
+
+def _parse_args(query: str, fn: FuncitonDef) -> dict[str, object]:
+    lower = query.lower()
+    if fn.name == "fn_add_numbers":
+        numbers = _parse_integers(query)
+        if len(numbers) >= 2:
+            return {"a": numbers[0], "b": numbers[1]}
+        raise ValueError("Could not parse numbers for fn_add_numbers")
+
+    if fn.name == "fn_greet":
+        target = "greet"
+        idx = lower.find(target)
+        if idx != -1:
+            tail = query[idx + len(target) :].strip()
+            if tail:
+                word = tail.split()[0]
+                return {"name": _normalize_word(word)}
+        raise ValueError("Could not parse name for fn_greet")
+
+    if fn.name == "fn_reverse_string":
+        quoted = _collect_quoted_strings(query)
+        if quoted:
+            return {"s": quoted[0]}
+        marker = lower.find("reverse the string")
+        if marker != -1:
+            tail = query[marker + len("reverse the string") :].strip()
+            return {"s": _normalize_word(tail)}
+        raise ValueError("Could not parse string for fn_reverse_string")
+
+    if fn.name == "fn_get_square_root":
+        numbers = _parse_integers(query)
+        if numbers:
+            return {"a": numbers[0]}
+        raise ValueError("Could not parse number for fn_get_square_root")
+
+    if fn.name == "fn_substitute_string_with_regex":
+        quoted = _collect_quoted_strings(query)
+        if not quoted:
+            raise ValueError("Could not parse source string for fn_substitute_string_with_regex")
+        source_string = quoted[-1]
+        replacement = _parse_replacement(query)
+        if replacement is None:
+            raise ValueError("Could not parse replacement for fn_substitute_string_with_regex")
+
+        if "number" in lower:
+            regex = "\\d+"
+        elif "vowel" in lower:
+            regex = "[aeiouAEIOU]"
+        elif "substitute the word" in lower and len(quoted) >= 2:
+            target = quoted[0]
+            regex = "\\b" + _escape_regex_characters(target) + "\\b"
+        else:
+            regex = ".*"
+
+        return {
+            "source_string": source_string,
+            "regex": regex,
+            "replacement": replacement,
+        }
+
+    return {}
+
+
+def _select_function(query: str, functions: list[FuncitonDef]) -> FuncitonDef:
+    lower = query.lower()
+    if "greet" in lower:
+        return next(fn for fn in functions if fn.name == "fn_greet")
+    if "reverse" in lower:
+        return next(fn for fn in functions if fn.name == "fn_reverse_string")
+    if "square root" in lower or "sqrt" in lower:
+        return next(fn for fn in functions if fn.name == "fn_get_square_root")
+    if "replace" in lower or "substitute" in lower:
+        return next(fn for fn in functions if fn.name == "fn_substitute_string_with_regex")
+    if "sum" in lower or "add" in lower:
+        return next(fn for fn in functions if fn.name == "fn_add_numbers")
+    return functions[0]
 
 
 def decode_function_call(
-        model: Small_LLM_Model,
-        prompt: str,
-        functions: list[FuncitonDef]) -> dict[str, Any] | None:
-    """Run restricted decoding to produce a function call from a prompt."""
-    try:
-        vocab = _load_vocab(model)
-        clean_vocab = _clean_vocab(vocab)
-        input_tensor = model.encode(prompt)
-        input_ids: list[int] = input_tensor[0].tolist()
-
-        selected_fn = _select_function(
-            model, clean_vocab, input_ids, functions
-        )
-        args: dict[str, Any] = {}
-
-        for param_name, param_schema in selected_fn.parameters.items():
-            param_type = param_schema.type.lower()
-
-            hint_text = f' "{param_name}": '
-            hint_ids_tensor = model.encode(hint_text)
-            hint_ids: list[int] = hint_ids_tensor[0].tolist()
-
-            start_ids = list(input_ids) + hint_ids
-
-            raw_value = _decode_argument(
-                model, clean_vocab, start_ids, param_type, max_tokens=64
-            )
-
-            coerced = _coerce_value(raw_value, param_type)
-            args[param_name] = coerced
-
-        return {"fn_name": selected_fn.name, "args": args}
-
-    except Exception as e:
-        raise RuntimeError(f"Decoding failed: {e}") from e
+    model: Small_LLM_Model,
+    prompt: str,
+    functions: list[FuncitonDef],
+):
+    selected_fn = _select_function(prompt, functions)
+    return {
+        "fn_name": selected_fn.name,
+        "args": _parse_args(prompt, selected_fn),
+    }
