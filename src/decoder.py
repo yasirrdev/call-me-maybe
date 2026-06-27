@@ -1,168 +1,235 @@
 import json
+from typing import Callable
+
+import numpy as np
+import sys
 
 from llm_sdk import Small_LLM_Model
-from src.models import FuncitonDef
+from src.models import FunctionCall, FunctionDef
+from src.prompt import build_argument_prompt, build_prompt
+
+Vocab = dict[int, str]
+
+MAX_FN_NAME_TOKENS = 24
+MAX_ARG_TOKENS = 8
+
+_CLEAN_MAP = (("Ġ", " "), ("Ċ", "\n"))
+_NUMBER_CHARS = set("0123456789.")
+_NUMBER_START_CHARS = set("0123456789.-")
+_BOOL_OPTIONS = ("true", "false")
+_FORBIDDEN_STRING_CHARS = {'"', "\n"}
 
 
-def _collect_quoted_strings(text: str) -> list[str]:
-    results: list[str] = []
-    index = 0
-    while index < len(text):
-        if text[index] in {"'", '"'}:
-            quote = text[index]
-            start = index + 1
-            end = start
-            while end < len(text) and text[end] != quote:
-                end += 1
-            if end < len(text):
-                results.append(text[start:end])
-                index = end + 1
-                continue
-        index += 1
-    return results
+def _clean_token(token: str) -> str:
+    for raw, repl in _CLEAN_MAP:
+        token = token.replace(raw, repl)
+    return token
 
 
-def _parse_integers(text: str) -> list[int]:
-    numbers: list[int] = []
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if (char == '+' or char == '-') and index + 1 < len(text) and text[index + 1].isdigit():
-            start = index
-            index += 2
-            while index < len(text) and text[index].isdigit():
-                index += 1
-            numbers.append(int(text[start:index]))
-            continue
-        if char.isdigit():
-            start = index
-            while index < len(text) and text[index].isdigit():
-                index += 1
-            numbers.append(int(text[start:index]))
-            continue
-        index += 1
-    return numbers
+def build_vocab(model: Small_LLM_Model) -> Vocab:
+    vocab_path = model.get_path_to_vocab_file()
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        raw_vocab: dict[str, int] = json.load(f)
+    return {
+        token_id: _clean_token(tok)
+        for tok, token_id in raw_vocab.items()
+    }
 
 
-def _normalize_word(text: str) -> str:
-    return text.strip().strip(".,!?\"' ")
+def _encode_ids(model: Small_LLM_Model, text: str) -> list[int]:
+    return model.encode(text)[0].tolist()
 
 
-def _parse_replacement(text: str) -> str | None:
-    lower = text.lower()
-    phrase = " with "
-    position = lower.find(phrase)
-    if position == -1:
+def _masked_argmax(logits: list[float], valid_ids: list[int]) -> int:
+    logits_arr = np.asarray(logits, dtype=np.float32)
+    mask = np.full(logits_arr.shape, -np.inf, dtype=np.float32)
+    mask[valid_ids] = logits_arr[valid_ids]
+    return int(np.argmax(mask))
+
+
+def _step(
+    model: Small_LLM_Model,
+    ids: list[int],
+    is_valid: Callable[[str], bool],
+    vocab: Vocab,
+) -> tuple[int, str] | None:
+    logits = model.get_logits_from_input_ids(ids)
+    valid_ids = [
+        token_id
+        for token_id, token_text in vocab.items()
+        if token_text and token_id < len(logits) and is_valid(token_text)
+    ]
+    if not valid_ids:
         return None
-    tail = text[position + len(phrase) :].strip()
-    if not tail:
-        return None
-    if tail[0] in {"'", '"'}:
-        quote = tail[0]
-        end = tail.find(quote, 1)
-        if end != -1:
-            return tail[1:end]
-        return tail[1:]
-    replacement = _normalize_word(tail)
-    if replacement.lower() in {"asterisk", "asterisks", "star"}:
-        return "*"
-    return replacement
+    next_id = _masked_argmax(logits, valid_ids)
+    return next_id, vocab[next_id]
 
 
-def _escape_regex_characters(text: str) -> str:
-    escaped = ""
-    for ch in text:
-        if ch in ".^$*+?{}[]\\|()":
-            escaped += "\\" + ch
-        else:
-            escaped += ch
-    return escaped
+def _generate_function_name(
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    base_ids: list[int],
+    names: list[str],
+) -> str:
+    ids = list(base_ids)
+    generated = ""
+    remaining = list(names)
+    for _ in range(MAX_FN_NAME_TOKENS):
+        if remaining == [generated]:
+            break
+
+        def is_valid(token_text: str, _gen: str = generated) -> bool:
+            prefix = _gen + token_text
+            return any(name.startswith(prefix) for name in remaining)
+
+        result = _step(model, ids, is_valid, vocab)
+        if result is None:
+            break
+        next_id, token_text = result
+        generated += token_text
+        ids.append(next_id)
+        remaining = [n for n in remaining if n.startswith(generated)]
+    return generated
 
 
-def _parse_args(query: str, fn: FuncitonDef) -> dict[str, object]:
-    lower = query.lower()
-    if fn.name == "fn_add_numbers":
-        numbers = _parse_integers(query)
-        if len(numbers) >= 2:
-            return {"a": numbers[0], "b": numbers[1]}
-        raise ValueError("Could not parse numbers for fn_add_numbers")
-
-    if fn.name == "fn_greet":
-        target = "greet"
-        idx = lower.find(target)
-        if idx != -1:
-            tail = query[idx + len(target) :].strip()
-            if tail:
-                word = tail.split()[0]
-                return {"name": _normalize_word(word)}
-        raise ValueError("Could not parse name for fn_greet")
-
-    if fn.name == "fn_reverse_string":
-        quoted = _collect_quoted_strings(query)
-        if quoted:
-            return {"s": quoted[0]}
-        marker = lower.find("reverse the string")
-        if marker != -1:
-            tail = query[marker + len("reverse the string") :].strip()
-            return {"s": _normalize_word(tail)}
-        raise ValueError("Could not parse string for fn_reverse_string")
-
-    if fn.name == "fn_get_square_root":
-        numbers = _parse_integers(query)
-        if numbers:
-            return {"a": numbers[0]}
-        raise ValueError("Could not parse number for fn_get_square_root")
-
-    if fn.name == "fn_substitute_string_with_regex":
-        quoted = _collect_quoted_strings(query)
-        if not quoted:
-            raise ValueError("Could not parse source string for fn_substitute_string_with_regex")
-        source_string = quoted[-1]
-        replacement = _parse_replacement(query)
-        if replacement is None:
-            raise ValueError("Could not parse replacement for fn_substitute_string_with_regex")
-
-        if "number" in lower:
-            regex = "\\d+"
-        elif "vowel" in lower:
-            regex = "[aeiouAEIOU]"
-        elif "substitute the word" in lower and len(quoted) >= 2:
-            target = quoted[0]
-            regex = "\\b" + _escape_regex_characters(target) + "\\b"
-        else:
-            regex = ".*"
-
-        return {
-            "source_string": source_string,
-            "regex": regex,
-            "replacement": replacement,
-        }
-
-    return {}
+def _is_valid_number_char(text: str, is_first: bool) -> bool:
+    allowed = _NUMBER_START_CHARS if is_first else _NUMBER_CHARS
+    stripped = text.strip()
+    return bool(stripped) and all(c in allowed for c in stripped)
 
 
-def _select_function(query: str, functions: list[FuncitonDef]) -> FuncitonDef:
-    lower = query.lower()
-    if "greet" in lower:
-        return next(fn for fn in functions if fn.name == "fn_greet")
-    if "reverse" in lower:
-        return next(fn for fn in functions if fn.name == "fn_reverse_string")
-    if "square root" in lower or "sqrt" in lower:
-        return next(fn for fn in functions if fn.name == "fn_get_square_root")
-    if "replace" in lower or "substitute" in lower:
-        return next(fn for fn in functions if fn.name == "fn_substitute_string_with_regex")
-    if "sum" in lower or "add" in lower:
-        return next(fn for fn in functions if fn.name == "fn_add_numbers")
-    return functions[0]
+def _generate_number(
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    base_ids: list[int],
+) -> float:
+    ids = list(base_ids)
+    generated = ""
+    for step in range(MAX_ARG_TOKENS):
+        is_first = step == 0
+
+        def is_valid(token_text: str, _first: bool = is_first) -> bool:
+            return _is_valid_number_char(token_text, _first)
+
+        result = _step(model, ids, is_valid, vocab)
+        if result is None:
+            break
+        next_id, token_text = result
+        generated += token_text.strip()
+        ids.append(next_id)
+    if not generated:
+        raise ValueError("Model failed to generate a valid number")
+    return float(generated)
+
+
+def _generate_boolean(
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    base_ids: list[int],
+) -> bool:
+    ids = list(base_ids)
+    generated = ""
+    remaining = list(_BOOL_OPTIONS)
+    for _ in range(MAX_ARG_TOKENS):
+        if remaining == [generated]:
+            break
+
+        def is_valid(token_text: str, _gen: str = generated) -> bool:
+            cleaned = token_text.strip().lower()
+            if not cleaned:
+                return False
+            prefix = _gen + cleaned
+            return any(opt.startswith(prefix) for opt in remaining)
+
+        result = _step(model, ids, is_valid, vocab)
+        if result is None:
+            break
+        next_id, token_text = result
+        generated += token_text.strip().lower()
+        ids.append(next_id)
+        remaining = [o for o in remaining if o.startswith(generated)]
+    if generated not in _BOOL_OPTIONS:
+        raise ValueError("Model failed to generate a valid boolean")
+    return generated == "true"
+
+
+def _generate_string(
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    base_ids: list[int],
+) -> str:
+    ids = list(base_ids)
+    generated = ""
+
+    def is_valid(token_text: str) -> bool:
+        return "\n" not in token_text
+
+    for _ in range(MAX_ARG_TOKENS):
+        result = _step(model, ids, is_valid, vocab)
+        if result is None:
+            break
+        next_id, token_text = result
+        if '"' in token_text:
+            break
+        generated += token_text
+        ids.append(next_id)
+    return generated.strip()
+
+
+def _generate_argument(
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    base_ids: list[int],
+    arg_type: str,
+) -> object:
+    if arg_type == "number":
+        return _generate_number(model, vocab, base_ids)
+    if arg_type == "boolean":
+        return _generate_boolean(model, vocab, base_ids)
+    return _generate_string(model, vocab, base_ids)
 
 
 def decode_function_call(
     model: Small_LLM_Model,
     prompt: str,
-    functions: list[FuncitonDef],
-):
-    selected_fn = _select_function(prompt, functions)
-    return {
-        "fn_name": selected_fn.name,
-        "args": _parse_args(prompt, selected_fn),
-    }
+    functions: list[FunctionDef],
+    vocab: Vocab | None = None,
+) -> FunctionCall | None:
+    if vocab is None:
+        vocab = build_vocab(model)
+
+    base_ids = _encode_ids(model, build_prompt(prompt, functions))
+    names = [fn.name for fn in functions]
+    fn_name = _generate_function_name(model, vocab, base_ids, names)
+
+    selected_fn = next(
+        (fn for fn in functions if fn.name == fn_name), None
+    )
+    if selected_fn is None:
+        print(
+            f"DEBUG fn_name generated: {fn_name!r} for prompt: {prompt!r}",
+            file=sys.stderr,
+        )
+        return None
+
+    args: dict[str, object] = {}
+    current_ids = base_ids + _encode_ids(model, fn_name)
+    for param_name, param in selected_fn.parameters.items():
+        current_ids += _encode_ids(
+            model, build_argument_prompt(param_name)
+        )
+        try:
+            value = _generate_argument(
+                model, vocab, current_ids, param.type
+            )
+        except ValueError as e:
+            print(
+                f"DEBUG arg fail param={param_name!r} "
+                f"type={param.type!r} error={e} prompt={prompt!r}",
+                file=sys.stderr,
+            )
+            return None
+        args[param_name] = value
+        current_ids += _encode_ids(model, str(value))
+
+    return FunctionCall(fn_name=fn_name, args=args)

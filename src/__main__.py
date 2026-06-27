@@ -1,12 +1,10 @@
-
-"""Entry point for call me maybe: function calling with restricted decoding."""
-
 import argparse
 import sys
 from pathlib import Path
+
 from llm_sdk import Small_LLM_Model
 
-from src.decoder import decode_function_call
+from src.decoder import build_vocab, decode_function_call
 from src.loader import load_functions, load_tests
 from src.models import OutputEntry
 from src.writer import write_results
@@ -14,13 +12,13 @@ from src.writer import write_results
 DEFAULT_INPUT = Path("data/input")
 DEFAULT_OUTPUT = Path("data/output/function_calling_results.json")
 
+_FN_DEF_FILENAMES = (
+    "function_definitions.json",
+    "functions_definition.json",
+)
+
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments.
-
-    Returns:
-        Parsed argument namespace.
-    """
     parser = argparse.ArgumentParser(
         description="Function calling with restricted decoding."
     )
@@ -39,17 +37,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    """Run the function calling pipeline."""
-    args = parse_args()
+def _resolve_fns_path(input_dir: Path) -> Path:
+    for name in _FN_DEF_FILENAMES:
+        candidate = input_dir / name
+        if candidate.exists():
+            return candidate
+    return input_dir / _FN_DEF_FILENAMES[0]
 
+
+def main() -> None:
+    args = parse_args()
     input_path = args.input
     if input_path.is_dir():
         tests_path = input_path / "function_calling_tests.json"
-        fns_path = input_path / "function_definitions.json"
+        fns_path = _resolve_fns_path(input_path)
     else:
         tests_path = input_path
-        fns_path = input_path.parent / "function_definitions.json"
+        fns_path = _resolve_fns_path(input_path.parent)
 
     try:
         prompts = load_tests(tests_path)
@@ -60,6 +64,7 @@ def main() -> None:
 
     try:
         model = Small_LLM_Model()
+        vocab = build_vocab(model)
     except Exception as e:
         print(f"Error loading model: {e}", file=sys.stderr)
         sys.exit(1)
@@ -67,7 +72,7 @@ def main() -> None:
     results = []
     for prompt in prompts:
         try:
-            call = decode_function_call(model, prompt, functions)
+            call = decode_function_call(model, prompt, functions, vocab)
             if call is None:
                 print(
                     f"Warning: no result for prompt: {prompt!r}",
@@ -77,8 +82,8 @@ def main() -> None:
             results.append(
                 OutputEntry(
                     prompt=prompt,
-                    fn_name=call["fn_name"],
-                    args=call["args"],
+                    fn_name=call.fn_name,
+                    args=call.args,
                 )
             )
         except Exception as e:

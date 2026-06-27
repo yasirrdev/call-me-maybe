@@ -1,19 +1,23 @@
 import json
-from src.models import FuncitonDef
+
+from src.models import FunctionDef
 
 
-def build_prompt(query: str, functions: list[FuncitonDef]) -> str:
-
+def build_prompt(query: str, functions: list[FunctionDef]) -> str:
     fn_list = json.dumps(
         [f.model_dump() for f in functions],
-        indent=2
+        indent=2,
+    )
+    return (
+        "You are a function calling assistant.\n"
+        "Given a user request, select the correct function "
+        "and arguments.\n"
+        "Available functions:\n"
+        f"{fn_list}\n\n"
+        f"User request: {query}\n\n"
+        "Function name:"
     )
 
-    return (
-        f"You are a function calling assistant.\n"
-        f"Given a user request, select the correct function and arguments.\n"
-        f"Respond ONLY with a JSON object with keys 'fn_name' and 'args'.\n\n"
-        f"Available functions:\n{fn_list}\n\n"
-        f"User request: {query}\n\n"
-        f"Response:"
-    )
+
+def build_argument_prompt(param_name: str) -> str:
+    return f'\n{param_name} = "'

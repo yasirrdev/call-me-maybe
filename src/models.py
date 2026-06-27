@@ -1,4 +1,5 @@
 from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -6,7 +7,7 @@ class FunctionParam(BaseModel):
     type: str
 
 
-class FuncitonDef(BaseModel):
+class FunctionDef(BaseModel):
     name: str
     description: str
     parameters: dict[str, FunctionParam]

@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
-from src.models import FuncitonDef
+
+from src.models import FunctionDef
 
 
 def load_tests(path: Path) -> list[str]:
-
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -12,11 +12,14 @@ def load_tests(path: Path) -> list[str]:
             raise ValueError("Tests file must be a JSON array.")
         prompts: list[str] = []
         for item in data:
-            if isinstance(item, dict) and "prompt" in item:
+            if isinstance(item, str):
+                prompts.append(item)
+            elif isinstance(item, dict) and "prompt" in item:
                 prompts.append(str(item["prompt"]))
             else:
                 raise ValueError(
-                    "Each test entry must be an object with a 'prompt' key."
+                    "Each test entry must be a string or an "
+                    "object with a 'prompt' key."
                 )
         return prompts
     except FileNotFoundError:
@@ -25,16 +28,14 @@ def load_tests(path: Path) -> list[str]:
         raise ValueError(f"Invalid JSON in tests file: {e}")
 
 
-def load_functions(path: Path) -> list[FuncitonDef]:
-    print("DEBUG PATH:", path)
-    print("DEBUG EXISTS:", path.exists())
+def load_functions(path: Path) -> list[FunctionDef]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError("Functions file must be a JSON array.")
-        return [FuncitonDef.model_validate(item) for item in data]
+        return [FunctionDef.model_validate(item) for item in data]
     except FileNotFoundError:
-        raise FileNotFoundError(f"Test file not found: {path}")
+        raise FileNotFoundError(f"Functions file not found: {path}")
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in tests file: {e}")
+        raise ValueError(f"Invalid JSON in functions file: {e}")
