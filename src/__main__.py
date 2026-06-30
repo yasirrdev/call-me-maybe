@@ -4,7 +4,7 @@ from pathlib import Path
 
 from llm_sdk import Small_LLM_Model
 
-from src.decoder import build_vocab, decode_function_call
+from src.decoder import build_small_vocab, build_vocab, decode_function_call
 from src.loader import load_functions, load_tests
 from src.models import OutputEntry
 from src.writer import write_results
@@ -19,6 +19,11 @@ _FN_DEF_FILENAMES = (
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments.
+
+    Returns:
+        The parsed argument namespace.
+    """
     parser = argparse.ArgumentParser(
         description="Function calling with restricted decoding."
     )
@@ -38,6 +43,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_fns_path(input_dir: Path) -> Path:
+    """Resolve the function definitions from the provided input directory."""
     for name in _FN_DEF_FILENAMES:
         candidate = input_dir / name
         if candidate.exists():
@@ -46,6 +52,7 @@ def _resolve_fns_path(input_dir: Path) -> Path:
 
 
 def main() -> None:
+    """Run the function calling pipeline end to end."""
     args = parse_args()
     input_path = args.input
     if input_path.is_dir():
@@ -65,14 +72,18 @@ def main() -> None:
     try:
         model = Small_LLM_Model()
         vocab = build_vocab(model)
+        small_vocab = build_small_vocab(vocab)
     except Exception as e:
         print(f"Error loading model: {e}", file=sys.stderr)
         sys.exit(1)
 
     results = []
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts, start=1):
+        print(f"[{i}/{len(prompts)}] {prompt}", file=sys.stderr)
         try:
-            call = decode_function_call(model, prompt, functions, vocab)
+            call = decode_function_call(
+                model, prompt, functions, vocab, small_vocab
+            )
             if call is None:
                 print(
                     f"Warning: no result for prompt: {prompt!r}",

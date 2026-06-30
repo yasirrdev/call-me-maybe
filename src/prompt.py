@@ -4,20 +4,19 @@ from src.models import FunctionDef
 
 
 def build_prompt(query: str, functions: list[FunctionDef]) -> str:
-    fn_list = json.dumps(
-        [f.model_dump() for f in functions],
-        indent=2,
-    )
+    """Build the full prompt sent to the model for a single request.
+
+    Args:
+        query: The natural language user request.
+        functions: Available function definitions.
+
+    Returns:
+        The prompt text, ending right before the JSON the model
+        should generate.
+    """
+    schema = json.dumps([f.model_dump() for f in functions])
     return (
-        "You are a function calling assistant.\n"
-        "Given a user request, select the correct function "
-        "and arguments.\n"
-        "Available functions:\n"
-        f"{fn_list}\n\n"
-        f"User request: {query}\n\n"
-        "Function name:"
+        f"Available Functions: {schema}\n"
+        f"User: {query}\n"
+        f"JSON: "
     )
-
-
-def build_argument_prompt(param_name: str) -> str:
-    return f'\n{param_name} = "'
